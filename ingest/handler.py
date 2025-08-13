@@ -1,27 +1,24 @@
 # ingest/handler.py
 # Index demo docs into OpenSearch Serverless using Amazon Titan embeddings.
-# Requires env vars (already set by your CDK stack):
-#   OS_ENDPOINT  -> e.g. https://xxxxxxxxxx.region.aoss.amazonaws.com
-#   OS_INDEX     -> e.g. "docs"
-#   OS_COLLECTION-> e.g. "rag-vectors" (not used directly here but handy)
-#
-# Deps (your requirements.txt already covers these):
-#   opensearch-py[requests], boto3
+# Env vars provided by the CDK stack:
+#   OS_ENDPOINT   -> e.g. https://xxxxxxxxxx.region.aoss.amazonaws.com
+#   OS_INDEX      -> e.g. "docs"
+#   OS_COLLECTION -> e.g. "rag-vectors" (not used directly here)
+#   EMBED_MODEL_ID -> e.g. "amazon.titan-embed-text-v1" (G1 Text) or "amazon.titan-embed-text-v2:0"
 
 import os, json, typing as T
 import boto3
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
-HOST = os.environ["OS_ENDPOINT"].removeprefix("https://").removeprefix("http://")
+HOST = os.environ["OS_ENDPOINT"].replace("https://", "").replace("http://", "")
 INDEX = os.environ["OS_INDEX"]
-EMBED_DIM = 1536
-MODEL_ID = "amazon.titan-embed-text-v2:0"  # Bedrock embeddings
+MODEL_ID = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v1")  # default to G1 Text
 
 bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 
 def embed(text: str) -> T.List[float]:
-    """Call Bedrock Titan embeddings and return a float vector."""
+    """Call Bedrock embeddings model and return a float vector."""
     body = json.dumps({"inputText": text}).encode("utf-8")
     resp = bedrock.invoke_model(
         modelId=MODEL_ID,
@@ -46,9 +43,14 @@ def connect() -> OpenSearch:
     )
 
 def ensure_index(client: OpenSearch):
-    """Create a KNN index if it doesn't exist yet."""
+    """
+    Create a KNN index if it doesn't exist yet.
+    Dimension is derived from the model by doing one tiny embed call,
+    so this works for both Titan G1 (v1) and Titan v2.
+    """
     if client.indices.exists(index=INDEX):
         return
+    dim = len(embed("dimension probe"))  # 1st call: figure out vector size
     mapping = {
         "settings": {"index": {"knn": True}},
         "mappings": {
@@ -56,7 +58,7 @@ def ensure_index(client: OpenSearch):
                 "text": {"type": "text"},
                 "vector": {
                     "type": "knn_vector",
-                    "dimension": EMBED_DIM,
+                    "dimension": dim,
                     "method": {"name": "hnsw", "space_type": "l2", "engine": "faiss"},
                 },
             }
@@ -65,7 +67,7 @@ def ensure_index(client: OpenSearch):
     client.indices.create(index=INDEX, body=mapping)
 
 def bulk_index(client: OpenSearch, docs: T.List[str]):
-    """NDJSON bulk index: [{index:..}, {doc}, ...]"""
+    """NDJSON bulk index: [{index:..}, {doc}, ...]."""
     actions = []
     for i, t in enumerate(docs):
         v = embed(t)
@@ -81,14 +83,16 @@ def lambda_handler(event=None, _ctx=None):
     docs = [
         "Hello world: first RAG document.",
         "This project indexes text into OpenSearch Serverless using Titan embeddings.",
-        "Ask a question; we retrieve most relevant chunks with k-NN search.",
+        "Ask a question; we retrieve the most relevant chunks with k-NN search.",
     ]
     client = connect()
     ensure_index(client)
     result = bulk_index(client, docs)
     return {
         "statusCode": 200,
-        "body": json.dumps({"bulk_errors": result.get("errors", False), "items": len(result.get("items", []))}),
+        "body": json.dumps(
+            {"bulk_errors": result.get("errors", False), "items": len(result.get("items", []))}
+        ),
     }
 
 if __name__ == "__main__":
