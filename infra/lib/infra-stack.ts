@@ -7,6 +7,7 @@ import * as oss from "aws-cdk-lib/aws-opensearchserverless";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
+import * as apigw from "aws-cdk-lib/aws-apigateway";   // ✅ API Gateway
 
 export class InfraStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -88,7 +89,7 @@ export class InfraStack extends cdk.Stack {
       },
     });
 
-    /** Data-access policy (dev): full access for Lambdas + account root */
+    /** Data-access policy (dev): full access for Lambdas */
     const account   = cdk.Stack.of(this).account;
     const partition = cdk.Stack.of(this).partition;
 
@@ -122,6 +123,7 @@ export class InfraStack extends cdk.Stack {
     dataPolicy.node.addDependency(answerFn);
     dataPolicy.node.addDependency(collection);
 
+    // ⏰ Daily ingest (03:00 UTC)
     new events.Rule(this, "DailyIngestSchedule", {
       schedule: events.Schedule.cron({ minute: "0", hour: "3" }),
       targets: [new targets.LambdaFunction(ingestFn)],
@@ -130,25 +132,41 @@ export class InfraStack extends cdk.Stack {
     // 🔐 Permissions
     const bedrockPerms = new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel"],
-      resources: ["*"], // tighten later
+      resources: ["*"],
     });
     [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(bedrockPerms));
 
-    // ✅ Add API-level permission for AOSS
     const osPerms = new iam.PolicyStatement({
       actions: [
-        "aoss:APIAccessAll",   // <— this is the key addition
+        "aoss:APIAccessAll",
         "aoss:CreateIndex",
         "aoss:WriteDocument",
         "aoss:ReadDocument",
         "aoss:DescribeIndex",
       ],
-      resources: ["*"], // tighten later
+      resources: ["*"],
     });
     [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(osPerms));
 
+    // 🌐 Public API for AnswerFn
+    const api = new apigw.RestApi(this, "RagApi", {
+      restApiName: "RagStackOverflowApi",
+      description: "RAG Q&A public endpoint",
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigw.Cors.ALL_ORIGINS,  // dev-friendly; tighten later
+        allowMethods: apigw.Cors.ALL_METHODS,
+        allowHeaders: ["Content-Type", "Authorization"],
+      },
+      deployOptions: { stageName: "prod" },
+    });
+
+    const answerRes = api.root.addResource("answer");
+    answerRes.addMethod("POST", new apigw.LambdaIntegration(answerFn, { proxy: true }));
+
+    // Outputs
     new cdk.CfnOutput(this, "OpenSearchCollectionEndpoint", {
       value: collection.attrCollectionEndpoint,
     });
+    new cdk.CfnOutput(this, "AnswerApiUrl", { value: `${api.url}answer` });
   }
 }

@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Internal Stack Overflow</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin: 12px 0; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    button { padding: 10px 16px; border-radius: 10px; border: 0; cursor: pointer; }
+    .primary { background: black; color: white; }
+    code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
+    .muted { color: #6b7280; }
+  </style>
+</head>
+<body>
+  <h1>Internal Stack Overflow (RAG)</h1>
+  <p class="muted">Ask a question about the indexed corpus. Returns top-k contexts + an answer.</p>
+
+  <div class="card">
+    <label>Endpoint: <code id="api"></code></label>
+    <div style="display:flex; gap:8px; margin-top:8px;">
+      <input id="q" style="flex:1; padding:10px; border-radius:10px; border:1px solid #e5e7eb" placeholder="What does this project do?" />
+      <input id="k" type="number" min="1" max="10" value="3" style="width:80px; padding:10px; border-radius:10px; border:1px solid #e5e7eb" />
+      <button class="primary" id="ask">Ask</button>
+    </div>
+  </div>
+
+  <div id="out"></div>
+
+  <script>
+    const API = "https://dv1kzytfz0.execute-api.us-east-1.amazonaws.com/prod/answer"; 
+    document.getElementById("api").textContent = API;
+
+    function el(html){const d=document.createElement('div'); d.innerHTML=html; return d.firstElementChild;}
+
+    async function ask(){
+      const q = document.getElementById('q').value || "What does this project do?";
+      const k = parseInt(document.getElementById('k').value || '3', 10);
+      const out = document.getElementById('out');
+      out.innerHTML = '';
+      out.append(el(`<div class="card"><em>Asking…</em></div>`));
+
+      try{
+        const r = await fetch(API, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question:q, k}) });
+        const j = await r.json();
+        out.innerHTML = '';
+
+        if(j.error){
+          out.append(el(`<div class="card"><b>Error:</b> ${j.error}<br><span class="muted">${j.detail||''}</span></div>`));
+          return;
+        }
+
+        out.append(el(`<div class="card"><b>Answer</b><p>${(j.answer||'').replace(/\n/g,'<br>')}</p></div>`));
+
+        if(Array.isArray(j.contexts)){
+          const ctx = j.contexts.map((t,i)=>`<li>${t} <span class="muted">(${(j.scores?.[i]??0).toFixed(4)})</span></li>`).join('');
+          out.append(el(`<div class="card"><b>Top-k contexts</b><ol>${ctx}</ol></div>`));
+        }
+      }catch(e){
+        out.innerHTML = '';
+        out.append(el(`<div class="card"><b>Network error</b><pre>${e}</pre></div>`));
+      }
+    }
+    document.getElementById('ask').addEventListener('click', ask);
+  </script>
+</body>
+</html>
