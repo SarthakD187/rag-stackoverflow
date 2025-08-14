@@ -67,7 +67,7 @@ export class InfraStack extends cdk.Stack {
         OS_COLLECTION: collectionName,
         OS_INDEX: "docs",
         OS_ENDPOINT: collection.attrCollectionEndpoint,  // AOSS endpoint
-        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",    // ✅ Titan Embeddings G1 – Text
+        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",    // Titan Embeddings G1 – Text
         // AWS_REGION is provided by Lambda runtime automatically
       },
     });
@@ -84,39 +84,48 @@ export class InfraStack extends cdk.Stack {
         OS_COLLECTION: collectionName,
         OS_INDEX: "docs",
         OS_ENDPOINT: collection.attrCollectionEndpoint,
-        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",    // ✅ same model
+        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
       },
     });
 
-    /** 👮 Data-access policy — DEV: full access for both Lambdas */
-const dataPolicy = new oss.CfnAccessPolicy(this, "VectorPolicy", {
-  name: "rag-access",
-  type: "data",
-  policy: JSON.stringify([
-    {
-      Rules: [
-        {
-          // all indexes in this collection
-          ResourceType: "index",
-          Resource: [`index/${collectionName}/*`],
-          Permission: ["aoss:*"],   // ← broad for dev; tighten later
-        },
-        {
-          // the collection itself
-          ResourceType: "collection",
-          Resource: [`collection/${collectionName}`],
-          Permission: ["aoss:*"],   // ← broad for dev; tighten later
-        },
-      ],
-      Principal: [ingestFn.role!.roleArn, queryFn.role!.roleArn],
-      Description: "Dev full access from Lambdas to collection & indexes",
-    },
-  ]),
-});
-dataPolicy.node.addDependency(ingestFn);
-dataPolicy.node.addDependency(queryFn);
-dataPolicy.node.addDependency(collection);
+    /** 👮 Data-access policy — DEV: full access for both Lambdas (incl. STS ARNs) */
+    const account = cdk.Stack.of(this).account;
+    const partition = cdk.Stack.of(this).partition;
 
+    const iamPrincipals = [ingestFn.role!.roleArn, queryFn.role!.roleArn];
+    const stsPrincipals = [
+      `arn:${partition}:sts::${account}:assumed-role/${ingestFn.role!.roleName}/*`,
+      `arn:${partition}:sts::${account}:assumed-role/${queryFn.role!.roleName}/*`,
+    ];
+
+    const dataPolicy = new oss.CfnAccessPolicy(this, "VectorPolicy", {
+      name: "rag-access",
+      type: "data",
+      policy: JSON.stringify([
+        {
+          Rules: [
+            {
+              // all indexes in this collection
+              ResourceType: "index",
+              Resource: [`index/${collectionName}/*`],
+              Permission: ["aoss:*"],   // broad for dev; tighten later
+            },
+            {
+              // the collection itself
+              ResourceType: "collection",
+              Resource: [`collection/${collectionName}`],
+              Permission: ["aoss:*"],   // broad for dev; tighten later
+            },
+          ],
+          // include BOTH IAM role ARNs and STS assumed-role ARNs
+          Principal: [...iamPrincipals, ...stsPrincipals],
+          Description: "Dev full access from Lambdas to collection & indexes",
+        },
+      ]),
+    });
+    dataPolicy.node.addDependency(ingestFn);
+    dataPolicy.node.addDependency(queryFn);
+    dataPolicy.node.addDependency(collection);
 
     // ⏰ Schedule daily ingest (03:00 UTC)
     new events.Rule(this, "DailyIngestSchedule", {
