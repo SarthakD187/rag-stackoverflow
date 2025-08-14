@@ -30,22 +30,26 @@ export class InfraStack extends cdk.Stack {
     });
 
     // 🌐 Network policy (public HTTPS for dev)
-    const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
-      name: "rag-network",
-      type: "network",
-      policy: JSON.stringify([
+const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
+  name: "rag-network",
+  type: "network",
+  policy: JSON.stringify([
+    {
+      Description: "Public access for dev (collection + dashboards)",
+      Rules: [
         {
-          Description: "Allow public access (dev)",
-          Rules: [
-            {
-              ResourceType: "collection",
-              Resource: [`collection/${collectionName}`],
-            },
-          ],
-          AllowFromPublic: true,
+          ResourceType: "collection",
+          Resource: [`collection/${collectionName}`],
         },
-      ]),
-    });
+        {
+          ResourceType: "dashboard",
+          Resource: [`collection/${collectionName}`],
+        },
+      ],
+      AllowFromPublic: true,
+    },
+  ]),
+});
 
     // 🧺 Collection
     const collection = new oss.CfnCollection(this, "VectorCollection", {
