@@ -27,17 +27,19 @@ def connect() -> OpenSearch:
     )
 
 def knn_search(client: OpenSearch, q_vec: T.List[float], k: int = 3):
-    # Try modern shape first; on 400, fall back to field-name form.
+    # AOSS vector collections accept the field-name form:
+    # { "query": { "knn": { "<field>": { "vector": [...], "k": k } } } }
     bodies = [
         {
             "size": k,
             "_source": ["text"],
-            "query": {"knn": {"field": "vector", "query_vector": q_vec, "k": k, "num_candidates": max(100, 5*k)}},
+            "query": {"knn": {"vector": {"vector": q_vec, "k": k}}},
         },
+        # Fallback variant (some builds expect "values" instead of "vector")
         {
             "size": k,
             "_source": ["text"],
-            "query": {"knn": {"vector": {"vector": q_vec, "k": k, "num_candidates": max(100, 5*k)}}},
+            "query": {"knn": {"vector": {"values": q_vec, "k": k}}},
         },
     ]
     last_err = None
