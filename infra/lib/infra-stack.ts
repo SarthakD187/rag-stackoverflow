@@ -77,7 +77,7 @@ export class InfraStack extends cdk.Stack {
       },
     });
 
-    // 🧠 Answer Lambda (retrieval + LLM synthesis)
+    // 🧠 Answer Lambda
     const answerFn = new lambdaPython.PythonFunction(this, "AnswerFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../answer"),
@@ -90,25 +90,25 @@ export class InfraStack extends cdk.Stack {
         OS_INDEX: "docs",
         OS_ENDPOINT: collection.attrCollectionEndpoint,
         EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
-        // Default to Claude 3 Haiku; switch to Titan Text if you prefer:
-        // e.g. "amazon.titan-text-lite-v1"
         TEXT_MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0",
       },
     });
 
-    /** 👮 Data-access policy — DEV: full access for Lambdas (IAM + STS ARNs) */
-    const account = cdk.Stack.of(this).account;
+    /** 👮 Data-access policy — DEV: full access for Lambdas + account root */
+    const account   = cdk.Stack.of(this).account;
     const partition = cdk.Stack.of(this).partition;
 
     const iamPrincipals = [
       ingestFn.role!.roleArn,
       queryFn.role!.roleArn,
-      answerFn.role!.roleArn, // ✅ include AnswerFn role ARN
+      answerFn.role!.roleArn,
+      // ✅ Dev-safety net: authorize the whole account (root)
+      `arn:${partition}:iam::${account}:root`,
     ];
     const stsPrincipals = [
       `arn:${partition}:sts::${account}:assumed-role/${ingestFn.role!.roleName}/*`,
       `arn:${partition}:sts::${account}:assumed-role/${queryFn.role!.roleName}/*`,
-      `arn:${partition}:sts::${account}:assumed-role/${answerFn.role!.roleName}/*`, // ✅ include AnswerFn STS ARN
+      `arn:${partition}:sts::${account}:assumed-role/${answerFn.role!.roleName}/*`,
     ];
 
     const dataPolicy = new oss.CfnAccessPolicy(this, "VectorPolicy", {
@@ -117,8 +117,8 @@ export class InfraStack extends cdk.Stack {
       policy: JSON.stringify([
         {
           Rules: [
-            { ResourceType: "index", Resource: [`index/${collectionName}/*`], Permission: ["aoss:*"] },
-            { ResourceType: "collection", Resource: [`collection/${collectionName}`], Permission: ["aoss:*"] },
+            { ResourceType: "index",      Resource: [`index/${collectionName}/*`],  Permission: ["aoss:*"] },
+            { ResourceType: "collection",  Resource: [`collection/${collectionName}`], Permission: ["aoss:*"] },
           ],
           Principal: [...iamPrincipals, ...stsPrincipals],
           Description: "Dev full access from Lambdas to collection & indexes",
@@ -127,7 +127,7 @@ export class InfraStack extends cdk.Stack {
     });
     dataPolicy.node.addDependency(ingestFn);
     dataPolicy.node.addDependency(queryFn);
-    dataPolicy.node.addDependency(answerFn); // ✅ ensure role exists before policy eval
+    dataPolicy.node.addDependency(answerFn);
     dataPolicy.node.addDependency(collection);
 
     // ⏰ Daily ingest (03:00 UTC)
@@ -139,15 +139,15 @@ export class InfraStack extends cdk.Stack {
     // 🔐 Permissions
     const bedrockPerms = new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel"],
-      resources: ["*"], // dev: broaden; tighten later by model ARN
+      resources: ["*"], // dev: narrow later by model ARN
     });
-    [ingestFn, queryFn, answerFn].forEach((fn) => fn.addToRolePolicy(bedrockPerms));
+    [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(bedrockPerms));
 
     const osPerms = new iam.PolicyStatement({
       actions: ["aoss:CreateIndex", "aoss:WriteDocument", "aoss:ReadDocument", "aoss:DescribeIndex"],
-      resources: ["*"], // dev: narrow later to specific ARNs
+      resources: ["*"], // dev: narrow later
     });
-    [ingestFn, queryFn, answerFn].forEach((fn) => fn.addToRolePolicy(osPerms));
+    [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(osPerms));
 
     new cdk.CfnOutput(this, "OpenSearchCollectionEndpoint", {
       value: collection.attrCollectionEndpoint,
