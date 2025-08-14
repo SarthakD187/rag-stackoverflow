@@ -1,5 +1,5 @@
 # ingest/handler.py
-import os, json, typing as T
+import os, json, time, typing as T
 import boto3
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
 from opensearchpy.exceptions import TransportError
@@ -30,7 +30,7 @@ def connect() -> OpenSearch:
     )
 
 def ensure_index(client: OpenSearch):
-    """Create k-NN index; ignore 'already exists'."""
+    """Create k-NN index; ignore 'already exists'; then wait until it’s visible."""
     dim = len(embed("dimension probe"))
     mapping = {
         "settings": {"index": {"knn": True}},
@@ -49,10 +49,21 @@ def ensure_index(client: OpenSearch):
         resp = client.indices.create(index=INDEX, body=mapping)
         print("CREATE_INDEX_RESP", resp)
     except TransportError as e:
-        # 400 → already exists; anything else bubble up
-        print("AOSS_ERROR_BODY", getattr(e, "info", None))
+        # 400 → already exists; anything else: bubble up
+        print("CREATE_INDEX_ERROR", getattr(e, "status_code", None), getattr(e, "info", None))
         if getattr(e, "status_code", None) not in (400,):
             raise
+
+    # Wait until HEAD /{index} returns true (AOSS can be eventually consistent)
+    for attempt in range(20):  # ~10s max
+        try:
+            if client.indices.exists(index=INDEX):
+                print("INDEX_READY", attempt)
+                return
+        except Exception as ex:
+            print("INDEX_EXISTS_CHECK_ERR", repr(ex))
+        time.sleep(0.5)
+    raise RuntimeError("Index did not become ready in time")
 
 def bulk_index(client: OpenSearch, docs: T.List[str]):
     actions = []
@@ -61,14 +72,17 @@ def bulk_index(client: OpenSearch, docs: T.List[str]):
         actions.append({"index": {"_index": INDEX, "_id": str(i)}})
         actions.append({"text": t, "vector": v})
     body = "\n".join(json.dumps(a) for a in actions) + "\n"
-    # ✅ Ask OpenSearch to make docs visible when indexing completes.
+    # Serverless has a 60s refresh interval; refresh=wait_for is fine to request,
+    # but even if it’s ignored, docs will appear within that interval.
     resp = client.bulk(body=body, params={"refresh": "wait_for"})
-    print("BULK_RESP_ERRORS", resp.get("errors"))
+    if resp.get("errors"):
+        # Print first few error items for quick diagnosis
+        bad = [it for it in resp.get("items", []) if list(it.values())[0].get("error")]
+        print("BULK_FIRST_ERRORS", json.dumps(bad[:3]))
     return resp
 
 def lambda_handler(event=None, _ctx=None):
     print("CALLER", boto3.client("sts").get_caller_identity())
-
     docs = [
         "Hello world: first RAG document.",
         "This project indexes text into OpenSearch Serverless using Titan embeddings.",
