@@ -14,7 +14,7 @@ export class InfraStack extends cdk.Stack {
 
     const collectionName = "rag-vectors";
 
-    // 🔐 Encryption policy
+    // 🔐 Encryption policy (must exist before collection)
     const enc = new oss.CfnSecurityPolicy(this, "EncryptionPolicy", {
       name: "rag-encryption",
       type: "encryption",
@@ -24,14 +24,14 @@ export class InfraStack extends cdk.Stack {
       }),
     });
 
-    // 🌐 Network policy (AOSS only accepts ResourceType: "collection")
+    // 🌐 Network policy (public for dev)
     const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
       name: "rag-network",
       type: "network",
       policy: JSON.stringify([
         {
-          Description: "Public access for dev (collection)",
-          Rules: [{ ResourceType: "collection", Resource: ["collection/*"] }],
+          Description: "Public access for dev",
+          Rules: [{ ResourceType: "collection", Resource: [`collection/${collectionName}`] }],
           AllowFromPublic: true,
         },
       ]),
@@ -77,16 +77,39 @@ export class InfraStack extends cdk.Stack {
       },
     });
 
-    /** 👮 Data-access policy — DEV permissive (IAM + STS + account root) */
+    // ✅ NEW: Answer Lambda (retrieval + LLM synthesis)
+    const answerFn = new lambdaPython.PythonFunction(this, "AnswerFn", {
+      runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
+      entry: path.join(__dirname, "../../answer"),
+      index: "handler.py",
+      handler: "lambda_handler",
+      memorySize: 512,
+      timeout: cdk.Duration.seconds(20),
+      environment: {
+        OS_COLLECTION: collectionName,
+        OS_INDEX: "docs",
+        OS_ENDPOINT: collection.attrCollectionEndpoint,
+        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
+        // Default to Claude 3 Haiku; switch to Titan Text if you prefer:
+        // e.g. "amazon.titan-text-lite-v1"
+        TEXT_MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0",
+      },
+    });
+
+    /** 👮 Data-access policy — DEV: full access for Lambdas (IAM + STS ARNs) */
     const account = cdk.Stack.of(this).account;
     const partition = cdk.Stack.of(this).partition;
 
-    const iamPrincipals = [ingestFn.role!.roleArn, queryFn.role!.roleArn];
+    const iamPrincipals = [
+      ingestFn.role!.roleArn,
+      queryFn.role!.roleArn,
+      answerFn.role!.roleArn, // ✅ include AnswerFn
+    ];
     const stsPrincipals = [
       `arn:${partition}:sts::${account}:assumed-role/${ingestFn.role!.roleName}/*`,
       `arn:${partition}:sts::${account}:assumed-role/${queryFn.role!.roleName}/*`,
+      `arn:${partition}:sts::${account}:assumed-role/${answerFn.role!.roleName}/*`, // ✅
     ];
-    const accountRoot = `arn:${partition}:iam::${account}:root`;
 
     const dataPolicy = new oss.CfnAccessPolicy(this, "VectorPolicy", {
       name: "rag-access",
@@ -94,45 +117,37 @@ export class InfraStack extends cdk.Stack {
       policy: JSON.stringify([
         {
           Rules: [
-            { ResourceType: "index", Resource: ["index/*/*"], Permission: ["aoss:*"] },
-            { ResourceType: "collection", Resource: ["collection/*"], Permission: ["aoss:*"] },
+            { ResourceType: "index", Resource: [`index/${collectionName}/*`], Permission: ["aoss:*"] },
+            { ResourceType: "collection", Resource: [`collection/${collectionName}`], Permission: ["aoss:*"] },
           ],
-          Principal: [...iamPrincipals, ...stsPrincipals, accountRoot],
-          Description: "Dev: full data access from Lambdas/account to AOSS",
+          Principal: [...iamPrincipals, ...stsPrincipals],
+          Description: "Dev full access from Lambdas to collection & indexes",
         },
       ]),
     });
     dataPolicy.node.addDependency(ingestFn);
     dataPolicy.node.addDependency(queryFn);
+    dataPolicy.node.addDependency(answerFn); // ✅ ensure created before policy eval
     dataPolicy.node.addDependency(collection);
 
-    // ⏰ Daily ingest
+    // ⏰ Daily ingest (03:00 UTC)
     new events.Rule(this, "DailyIngestSchedule", {
       schedule: events.Schedule.cron({ minute: "0", hour: "3" }),
       targets: [new targets.LambdaFunction(ingestFn)],
     });
 
-    // 🔐 IAM permissions for Bedrock + AOSS data-plane
+    // 🔐 Permissions
     const bedrockPerms = new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel"],
-      resources: ["*"],
+      resources: ["*"], // dev: broaden; tighten later by model ARN
     });
-    ingestFn.addToRolePolicy(bedrockPerms);
-    queryFn.addToRolePolicy(bedrockPerms);
+    [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(bedrockPerms));
 
-    // ⬅️ The key fix: include aoss:APIAccessAll at IAM layer
     const osPerms = new iam.PolicyStatement({
-      actions: [
-        "aoss:APIAccessAll",
-        "aoss:CreateIndex",
-        "aoss:WriteDocument",
-        "aoss:ReadDocument",
-        "aoss:DescribeIndex",
-      ],
-      resources: ["*"],
+      actions: ["aoss:CreateIndex", "aoss:WriteDocument", "aoss:ReadDocument", "aoss:DescribeIndex"],
+      resources: ["*"], // dev: narrow later to specific ARNs
     });
-    ingestFn.addToRolePolicy(osPerms);
-    queryFn.addToRolePolicy(osPerms);
+    [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(osPerms));
 
     new cdk.CfnOutput(this, "OpenSearchCollectionEndpoint", {
       value: collection.attrCollectionEndpoint,
