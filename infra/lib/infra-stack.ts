@@ -77,7 +77,7 @@ export class InfraStack extends cdk.Stack {
       },
     });
 
-    // ✅ NEW: Answer Lambda (retrieval + LLM synthesis)
+    // 🧠 Answer Lambda (retrieval + LLM synthesis)
     const answerFn = new lambdaPython.PythonFunction(this, "AnswerFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../answer"),
@@ -103,12 +103,12 @@ export class InfraStack extends cdk.Stack {
     const iamPrincipals = [
       ingestFn.role!.roleArn,
       queryFn.role!.roleArn,
-      answerFn.role!.roleArn, // ✅ include AnswerFn
+      answerFn.role!.roleArn, // ✅ include AnswerFn role ARN
     ];
     const stsPrincipals = [
       `arn:${partition}:sts::${account}:assumed-role/${ingestFn.role!.roleName}/*`,
       `arn:${partition}:sts::${account}:assumed-role/${queryFn.role!.roleName}/*`,
-      `arn:${partition}:sts::${account}:assumed-role/${answerFn.role!.roleName}/*`, // ✅
+      `arn:${partition}:sts::${account}:assumed-role/${answerFn.role!.roleName}/*`, // ✅ include AnswerFn STS ARN
     ];
 
     const dataPolicy = new oss.CfnAccessPolicy(this, "VectorPolicy", {
@@ -127,7 +127,7 @@ export class InfraStack extends cdk.Stack {
     });
     dataPolicy.node.addDependency(ingestFn);
     dataPolicy.node.addDependency(queryFn);
-    dataPolicy.node.addDependency(answerFn); // ✅ ensure created before policy eval
+    dataPolicy.node.addDependency(answerFn); // ✅ ensure role exists before policy eval
     dataPolicy.node.addDependency(collection);
 
     // ⏰ Daily ingest (03:00 UTC)
@@ -141,13 +141,13 @@ export class InfraStack extends cdk.Stack {
       actions: ["bedrock:InvokeModel"],
       resources: ["*"], // dev: broaden; tighten later by model ARN
     });
-    [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(bedrockPerms));
+    [ingestFn, queryFn, answerFn].forEach((fn) => fn.addToRolePolicy(bedrockPerms));
 
     const osPerms = new iam.PolicyStatement({
       actions: ["aoss:CreateIndex", "aoss:WriteDocument", "aoss:ReadDocument", "aoss:DescribeIndex"],
       resources: ["*"], // dev: narrow later to specific ARNs
     });
-    [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(osPerms));
+    [ingestFn, queryFn, answerFn].forEach((fn) => fn.addToRolePolicy(osPerms));
 
     new cdk.CfnOutput(this, "OpenSearchCollectionEndpoint", {
       value: collection.attrCollectionEndpoint,
