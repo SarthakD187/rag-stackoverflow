@@ -1,4 +1,3 @@
-// infra/lib/infra-stack.ts
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as path from "path";
@@ -15,7 +14,6 @@ export class InfraStack extends cdk.Stack {
 
     const collectionName = "rag-vectors";
 
-    // 🔐 Encryption policy
     const enc = new oss.CfnSecurityPolicy(this, "EncryptionPolicy", {
       name: "rag-encryption",
       type: "encryption",
@@ -25,7 +23,6 @@ export class InfraStack extends cdk.Stack {
       }),
     });
 
-    // 🌐 Network policy (public for dev)
     const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
       name: "rag-network",
       type: "network",
@@ -38,7 +35,6 @@ export class InfraStack extends cdk.Stack {
       ]),
     });
 
-    // 🧺 Collection
     const collection = new oss.CfnCollection(this, "VectorCollection", {
       name: collectionName,
       type: "VECTORSEARCH",
@@ -46,7 +42,6 @@ export class InfraStack extends cdk.Stack {
     collection.addDependency(enc);
     collection.addDependency(net);
 
-    // 🧰 Ingest Lambda
     const ingestFn = new lambdaPython.PythonFunction(this, "IngestFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../ingest"),
@@ -62,7 +57,6 @@ export class InfraStack extends cdk.Stack {
       },
     });
 
-    // 🔎 Query Lambda
     const queryFn = new lambdaPython.PythonFunction(this, "QueryFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../query"),
@@ -78,7 +72,6 @@ export class InfraStack extends cdk.Stack {
       },
     });
 
-    // 🧠 Answer Lambda
     const answerFn = new lambdaPython.PythonFunction(this, "AnswerFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../answer"),
@@ -95,16 +88,15 @@ export class InfraStack extends cdk.Stack {
       },
     });
 
-    /** 👮 Data-access policy — DEV: full access for Lambdas (+ account root) */
-    const account = cdk.Stack.of(this).account;
+    /** Data-access policy (dev): full access for Lambdas + account root */
+    const account   = cdk.Stack.of(this).account;
     const partition = cdk.Stack.of(this).partition;
 
     const iamPrincipals = [
       ingestFn.role!.roleArn,
       queryFn.role!.roleArn,
       answerFn.role!.roleArn,
-      // DEV safety net — remove later
-      `arn:${partition}:iam::${account}:root`,
+      `arn:${partition}:iam::${account}:root`, // dev safety net; remove later
     ];
     const stsPrincipals = [
       `arn:${partition}:sts::${account}:assumed-role/${ingestFn.role!.roleName}/*`,
@@ -131,7 +123,6 @@ export class InfraStack extends cdk.Stack {
     dataPolicy.node.addDependency(answerFn);
     dataPolicy.node.addDependency(collection);
 
-    // ⏰ Daily ingest (03:00 UTC)
     new events.Rule(this, "DailyIngestSchedule", {
       schedule: events.Schedule.cron({ minute: "0", hour: "3" }),
       targets: [new targets.LambdaFunction(ingestFn)],
@@ -140,20 +131,23 @@ export class InfraStack extends cdk.Stack {
     // 🔐 Permissions
     const bedrockPerms = new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel"],
-      resources: ["*"],
+      resources: ["*"], // tighten later
     });
     [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(bedrockPerms));
 
+    // ✅ Add API-level permission for AOSS
     const osPerms = new iam.PolicyStatement({
-      actions: ["aoss:CreateIndex", "aoss:WriteDocument", "aoss:ReadDocument", "aoss:DescribeIndex"],
-      resources: ["*"],
+      actions: [
+        "aoss:APIAccessAll",   // <— this is the key addition
+        "aoss:CreateIndex",
+        "aoss:WriteDocument",
+        "aoss:ReadDocument",
+        "aoss:DescribeIndex",
+      ],
+      resources: ["*"], // tighten later
     });
     [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(osPerms));
 
-    // 🔎 Helpful outputs for verification
-    new cdk.CfnOutput(this, "IngestRoleArn", { value: ingestFn.role!.roleArn });
-    new cdk.CfnOutput(this, "QueryRoleArn",  { value: queryFn.role!.roleArn  });
-    new cdk.CfnOutput(this, "AnswerRoleArn", { value: answerFn.role!.roleArn });
     new cdk.CfnOutput(this, "OpenSearchCollectionEndpoint", {
       value: collection.attrCollectionEndpoint,
     });
