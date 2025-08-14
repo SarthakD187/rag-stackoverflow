@@ -27,27 +27,18 @@ def connect() -> OpenSearch:
     )
 
 def knn_search(client: OpenSearch, q_vec: T.List[float], k: int = 3):
-    # AOSS vector collections accept the field-name form:
-    # { "query": { "knn": { "<field>": { "vector": [...], "k": k } } } }
+    # AOSS-friendly bodies (we already know these shapes work)
     bodies = [
-        {
-            "size": k,
-            "_source": ["text"],
-            "query": {"knn": {"vector": {"vector": q_vec, "k": k}}},
-        },
-        # Fallback variant (some builds expect "values" instead of "vector")
-        {
-            "size": k,
-            "_source": ["text"],
-            "query": {"knn": {"vector": {"values": q_vec, "k": k}}},
-        },
+        {"size": k, "_source": ["text"], "query": {"knn": {"vector": {"vector": q_vec, "k": k}}}},
+        {"size": k, "_source": ["text"], "query": {"knn": {"vector": {"values": q_vec, "k": k}}}},
     ]
     last_err = None
     for i, body in enumerate(bodies, 1):
         try:
             res = client.search(index=INDEX, body=body)
             hits = res.get("hits", {}).get("hits", [])
-            return [h.get("_source", {}).get("text", "") for h in hits]
+            # return text + score so we can dedupe and show confidence if needed
+            return [{"text": h.get("_source", {}).get("text", ""), "score": h.get("_score")} for h in hits]
         except TransportError as e:
             print(f"SEARCH_SHAPE_{i}_ERROR", getattr(e, "status_code", None), getattr(e, "info", None))
             last_err = e
@@ -62,18 +53,25 @@ def lambda_handler(event=None, _ctx=None):
 
     q_vec = embed(question)
     client = connect()
+    raw = knn_search(client, q_vec, k=k)
 
-    # light retry in case of immediate-after-ingest consistency
-    for attempt in range(3):
-        try:
-            texts = knn_search(client, q_vec, k=k)
-            return {"statusCode": 200, "body": json.dumps({"question": question, "k": k, "results": texts})}
-        except TransportError as e:
-            if getattr(e, "status_code", None) == 404:
-                time.sleep(0.5)
-                continue
-            raise
-    return {"statusCode": 500, "body": json.dumps({"error": "search failed after retries"})}
+    # ✅ Deduplicate by text while preserving order
+    seen = set()
+    uniq = []
+    for h in raw:
+        t = h["text"]
+        if t and t not in seen:
+            seen.add(t)
+            uniq.append(h)
 
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "question": question,
+            "k": k,
+            "results": [h["text"] for h in uniq],
+            "scores": [h["score"] for h in uniq],
+        }),
+    }
 if __name__ == "__main__":
     print(lambda_handler({"question": "What does this project do?", "k": 3}))
