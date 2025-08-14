@@ -30,6 +30,7 @@ def connect() -> OpenSearch:
     )
 
 def ensure_index(client: OpenSearch):
+    """Create k-NN index; ignore 'already exists'."""
     dim = len(embed("dimension probe"))
     mapping = {
         "settings": {"index": {"knn": True}},
@@ -45,15 +46,12 @@ def ensure_index(client: OpenSearch):
         },
     }
     try:
-        client.indices.create(index=INDEX, body=mapping)
+        resp = client.indices.create(index=INDEX, body=mapping)
+        print("CREATE_INDEX_RESP", resp)
     except TransportError as e:
-        # 400 → already exists; ignore. 403 → rethrow after logging body.
-        status = getattr(e, "status_code", None)
-        try:
-            print("AOSS_ERROR_BODY", e.info)
-        except Exception:
-            pass
-        if status not in (400,):
+        # 400 → already exists; anything else bubble up
+        print("AOSS_ERROR_BODY", getattr(e, "info", None))
+        if getattr(e, "status_code", None) not in (400,):
             raise
 
 def bulk_index(client: OpenSearch, docs: T.List[str]):
@@ -63,12 +61,12 @@ def bulk_index(client: OpenSearch, docs: T.List[str]):
         actions.append({"index": {"_index": INDEX, "_id": str(i)}})
         actions.append({"text": t, "vector": v})
     body = "\n".join(json.dumps(a) for a in actions) + "\n"
-    resp = client.bulk(body=body)
-    client.indices.refresh(index=INDEX)
+    # ✅ Ask OpenSearch to make docs visible when indexing completes.
+    resp = client.bulk(body=body, params={"refresh": "wait_for"})
+    print("BULK_RESP_ERRORS", resp.get("errors"))
     return resp
 
 def lambda_handler(event=None, _ctx=None):
-    # Who does AOSS see?
     print("CALLER", boto3.client("sts").get_caller_identity())
 
     docs = [
