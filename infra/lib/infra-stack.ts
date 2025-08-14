@@ -1,3 +1,4 @@
+// infra/lib/infra-stack.ts
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as path from "path";
@@ -14,7 +15,7 @@ export class InfraStack extends cdk.Stack {
 
     const collectionName = "rag-vectors";
 
-    // 🔐 Encryption policy (must exist before collection)
+    // 🔐 Encryption policy
     const enc = new oss.CfnSecurityPolicy(this, "EncryptionPolicy", {
       name: "rag-encryption",
       type: "encryption",
@@ -94,15 +95,15 @@ export class InfraStack extends cdk.Stack {
       },
     });
 
-    /** 👮 Data-access policy — DEV: full access for Lambdas + account root */
-    const account   = cdk.Stack.of(this).account;
+    /** 👮 Data-access policy — DEV: full access for Lambdas (+ account root) */
+    const account = cdk.Stack.of(this).account;
     const partition = cdk.Stack.of(this).partition;
 
     const iamPrincipals = [
       ingestFn.role!.roleArn,
       queryFn.role!.roleArn,
       answerFn.role!.roleArn,
-      // ✅ Dev-safety net: authorize the whole account (root)
+      // DEV safety net — remove later
       `arn:${partition}:iam::${account}:root`,
     ];
     const stsPrincipals = [
@@ -117,8 +118,8 @@ export class InfraStack extends cdk.Stack {
       policy: JSON.stringify([
         {
           Rules: [
-            { ResourceType: "index",      Resource: [`index/${collectionName}/*`],  Permission: ["aoss:*"] },
-            { ResourceType: "collection",  Resource: [`collection/${collectionName}`], Permission: ["aoss:*"] },
+            { ResourceType: "index", Resource: [`index/${collectionName}/*`], Permission: ["aoss:*"] },
+            { ResourceType: "collection", Resource: [`collection/${collectionName}`], Permission: ["aoss:*"] },
           ],
           Principal: [...iamPrincipals, ...stsPrincipals],
           Description: "Dev full access from Lambdas to collection & indexes",
@@ -139,16 +140,20 @@ export class InfraStack extends cdk.Stack {
     // 🔐 Permissions
     const bedrockPerms = new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel"],
-      resources: ["*"], // dev: narrow later by model ARN
+      resources: ["*"],
     });
     [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(bedrockPerms));
 
     const osPerms = new iam.PolicyStatement({
       actions: ["aoss:CreateIndex", "aoss:WriteDocument", "aoss:ReadDocument", "aoss:DescribeIndex"],
-      resources: ["*"], // dev: narrow later
+      resources: ["*"],
     });
     [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(osPerms));
 
+    // 🔎 Helpful outputs for verification
+    new cdk.CfnOutput(this, "IngestRoleArn", { value: ingestFn.role!.roleArn });
+    new cdk.CfnOutput(this, "QueryRoleArn",  { value: queryFn.role!.roleArn  });
+    new cdk.CfnOutput(this, "AnswerRoleArn", { value: answerFn.role!.roleArn });
     new cdk.CfnOutput(this, "OpenSearchCollectionEndpoint", {
       value: collection.attrCollectionEndpoint,
     });
