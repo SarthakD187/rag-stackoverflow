@@ -29,27 +29,21 @@ export class InfraStack extends cdk.Stack {
       }),
     });
 
-    // 🌐 Network policy (public HTTPS for dev)
-const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
-  name: "rag-network",
-  type: "network",
-  policy: JSON.stringify([
-    {
-      Description: "Public access for dev (collection + dashboards)",
-      Rules: [
+    // 🌐 Network policy (public HTTPS for dev) — wildcard collection + dashboard
+    const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
+      name: "rag-network",
+      type: "network",
+      policy: JSON.stringify([
         {
-          ResourceType: "collection",
-          Resource: [`collection/${collectionName}`],
+          Description: "Public access for dev (collection + dashboards)",
+          Rules: [
+            { ResourceType: "collection", Resource: ["collection/*"] },
+            { ResourceType: "dashboard", Resource: ["dashboard/*"] },
+          ],
+          AllowFromPublic: true,
         },
-        {
-          ResourceType: "dashboard",
-          Resource: [`collection/${collectionName}`],
-        },
-      ],
-      AllowFromPublic: true,
-    },
-  ]),
-});
+      ]),
+    });
 
     // 🧺 Collection
     const collection = new oss.CfnCollection(this, "VectorCollection", {
@@ -70,9 +64,9 @@ const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
       environment: {
         OS_COLLECTION: collectionName,
         OS_INDEX: "docs",
-        OS_ENDPOINT: collection.attrCollectionEndpoint,  // AOSS endpoint
-        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",    // Titan Embeddings G1 – Text
-        // AWS_REGION is provided by Lambda runtime automatically
+        OS_ENDPOINT: collection.attrCollectionEndpoint,  // AOSS data endpoint
+        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
+        // AWS_REGION is provided by Lambda automatically
       },
     });
 
@@ -92,7 +86,7 @@ const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
       },
     });
 
-    /** 👮 Data-access policy — DEV: full access for both Lambdas (incl. STS ARNs) */
+    /** 👮 Data-access policy — DEV: full access (wildcards + IAM + STS + account root) */
     const account = cdk.Stack.of(this).account;
     const partition = cdk.Stack.of(this).partition;
 
@@ -101,6 +95,7 @@ const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
       `arn:${partition}:sts::${account}:assumed-role/${ingestFn.role!.roleName}/*`,
       `arn:${partition}:sts::${account}:assumed-role/${queryFn.role!.roleName}/*`,
     ];
+    const accountRoot = `arn:${partition}:iam::${account}:root`;
 
     const dataPolicy = new oss.CfnAccessPolicy(this, "VectorPolicy", {
       name: "rag-access",
@@ -108,22 +103,11 @@ const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
       policy: JSON.stringify([
         {
           Rules: [
-            {
-              // all indexes in this collection
-              ResourceType: "index",
-              Resource: [`index/${collectionName}/*`],
-              Permission: ["aoss:*"],   // broad for dev; tighten later
-            },
-            {
-              // the collection itself
-              ResourceType: "collection",
-              Resource: [`collection/${collectionName}`],
-              Permission: ["aoss:*"],   // broad for dev; tighten later
-            },
+            { ResourceType: "index", Resource: ["index/*/*"], Permission: ["aoss:*"] },
+            { ResourceType: "collection", Resource: ["collection/*"], Permission: ["aoss:*"] },
           ],
-          // include BOTH IAM role ARNs and STS assumed-role ARNs
-          Principal: [...iamPrincipals, ...stsPrincipals],
-          Description: "Dev full access from Lambdas to collection & indexes",
+          Principal: [...iamPrincipals, ...stsPrincipals, accountRoot],
+          Description: "Dev: full data access from Lambdas/account to AOSS",
         },
       ]),
     });
@@ -137,7 +121,7 @@ const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
       targets: [new targets.LambdaFunction(ingestFn)],
     });
 
-    // 🔐 Bedrock + AOSS permissions (broad for dev)
+    // 🔐 Bedrock + (optional) AOSS IAM actions — not strictly required for data-plane, but fine
     const bedrockPerms = new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel"],
       resources: ["*"],
@@ -146,18 +130,12 @@ const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
     queryFn.addToRolePolicy(bedrockPerms);
 
     const osPerms = new iam.PolicyStatement({
-      actions: [
-        "aoss:CreateIndex",
-        "aoss:WriteDocument",
-        "aoss:ReadDocument",
-        "aoss:DescribeIndex",
-      ],
+      actions: ["aoss:CreateIndex", "aoss:WriteDocument", "aoss:ReadDocument", "aoss:DescribeIndex"],
       resources: ["*"],
     });
     ingestFn.addToRolePolicy(osPerms);
     queryFn.addToRolePolicy(osPerms);
 
-    // 🔎 Output the collection endpoint for reference
     new cdk.CfnOutput(this, "OpenSearchCollectionEndpoint", {
       value: collection.attrCollectionEndpoint,
     });
