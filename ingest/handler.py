@@ -67,16 +67,15 @@ def ensure_index(client: OpenSearch):
 
 def bulk_index(client: OpenSearch, docs: T.List[str]):
     actions = []
-    for i, t in enumerate(docs):
+    for t in docs:
         v = embed(t)
-        actions.append({"index": {"_index": INDEX, "_id": str(i)}})
+        # ✅ Do NOT provide _id in Serverless — it will auto-generate one
+        actions.append({"index": {"_index": INDEX}})
         actions.append({"text": t, "vector": v})
     body = "\n".join(json.dumps(a) for a in actions) + "\n"
-    # Serverless has a 60s refresh interval; refresh=wait_for is fine to request,
-    # but even if it’s ignored, docs will appear within that interval.
+    # Make docs visible once indexing finishes
     resp = client.bulk(body=body, params={"refresh": "wait_for"})
     if resp.get("errors"):
-        # Print first few error items for quick diagnosis
         bad = [it for it in resp.get("items", []) if list(it.values())[0].get("error")]
         print("BULK_FIRST_ERRORS", json.dumps(bad[:3]))
     return resp
