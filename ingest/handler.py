@@ -1,6 +1,4 @@
 # ingest/handler.py
-# Index demo docs into OpenSearch Serverless using Amazon Titan embeddings.
-# Env vars: OS_ENDPOINT, OS_INDEX, OS_COLLECTION, EMBED_MODEL_ID
 import os, json, typing as T
 import boto3
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
@@ -32,7 +30,6 @@ def connect() -> OpenSearch:
     )
 
 def ensure_index(client: OpenSearch):
-    """Create k-NN index; ignore 'already exists'."""
     dim = len(embed("dimension probe"))
     mapping = {
         "settings": {"index": {"knn": True}},
@@ -50,7 +47,13 @@ def ensure_index(client: OpenSearch):
     try:
         client.indices.create(index=INDEX, body=mapping)
     except TransportError as e:
-        if getattr(e, "status_code", None) not in (400,):  # already exists
+        # 400 → already exists; ignore. 403 → rethrow after logging body.
+        status = getattr(e, "status_code", None)
+        try:
+            print("AOSS_ERROR_BODY", e.info)
+        except Exception:
+            pass
+        if status not in (400,):
             raise
 
 def bulk_index(client: OpenSearch, docs: T.List[str]):
@@ -65,7 +68,7 @@ def bulk_index(client: OpenSearch, docs: T.List[str]):
     return resp
 
 def lambda_handler(event=None, _ctx=None):
-    # 🔎 Log caller to confirm principal that AOSS sees
+    # Who does AOSS see?
     print("CALLER", boto3.client("sts").get_caller_identity())
 
     docs = [

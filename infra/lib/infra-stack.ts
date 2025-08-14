@@ -14,7 +14,7 @@ export class InfraStack extends cdk.Stack {
 
     const collectionName = "rag-vectors";
 
-    // 🔐 Encryption policy (must exist before collection)
+    // 🔐 Encryption policy
     const enc = new oss.CfnSecurityPolicy(this, "EncryptionPolicy", {
       name: "rag-encryption",
       type: "encryption",
@@ -24,7 +24,7 @@ export class InfraStack extends cdk.Stack {
       }),
     });
 
-    // 🌐 Network policy (public HTTPS for dev) — ONLY "collection" is valid here
+    // 🌐 Network policy (AOSS only accepts ResourceType: "collection")
     const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
       name: "rag-network",
       type: "network",
@@ -56,7 +56,7 @@ export class InfraStack extends cdk.Stack {
       environment: {
         OS_COLLECTION: collectionName,
         OS_INDEX: "docs",
-        OS_ENDPOINT: collection.attrCollectionEndpoint, // AOSS data endpoint
+        OS_ENDPOINT: collection.attrCollectionEndpoint,
         EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
       },
     });
@@ -77,7 +77,7 @@ export class InfraStack extends cdk.Stack {
       },
     });
 
-    /** 👮 Data-access policy — DEV: full access (wildcards + IAM + STS + account root) */
+    /** 👮 Data-access policy — DEV permissive (IAM + STS + account root) */
     const account = cdk.Stack.of(this).account;
     const partition = cdk.Stack.of(this).partition;
 
@@ -106,13 +106,13 @@ export class InfraStack extends cdk.Stack {
     dataPolicy.node.addDependency(queryFn);
     dataPolicy.node.addDependency(collection);
 
-    // ⏰ Schedule daily ingest (03:00 UTC)
+    // ⏰ Daily ingest
     new events.Rule(this, "DailyIngestSchedule", {
       schedule: events.Schedule.cron({ minute: "0", hour: "3" }),
       targets: [new targets.LambdaFunction(ingestFn)],
     });
 
-    // 🔐 Bedrock + (optional) AOSS IAM actions
+    // 🔐 IAM permissions for Bedrock + AOSS data-plane
     const bedrockPerms = new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel"],
       resources: ["*"],
@@ -120,8 +120,15 @@ export class InfraStack extends cdk.Stack {
     ingestFn.addToRolePolicy(bedrockPerms);
     queryFn.addToRolePolicy(bedrockPerms);
 
+    // ⬅️ The key fix: include aoss:APIAccessAll at IAM layer
     const osPerms = new iam.PolicyStatement({
-      actions: ["aoss:CreateIndex", "aoss:WriteDocument", "aoss:ReadDocument", "aoss:DescribeIndex"],
+      actions: [
+        "aoss:APIAccessAll",
+        "aoss:CreateIndex",
+        "aoss:WriteDocument",
+        "aoss:ReadDocument",
+        "aoss:DescribeIndex",
+      ],
       resources: ["*"],
     });
     ingestFn.addToRolePolicy(osPerms);
