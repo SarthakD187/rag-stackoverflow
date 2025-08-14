@@ -1,7 +1,6 @@
 # ingest/handler.py
 # Index demo docs into OpenSearch Serverless using Amazon Titan embeddings.
-# Env vars:
-#   OS_ENDPOINT, OS_INDEX, OS_COLLECTION, EMBED_MODEL_ID
+# Env vars: OS_ENDPOINT, OS_INDEX, OS_COLLECTION, EMBED_MODEL_ID
 import os, json, typing as T
 import boto3
 from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
@@ -17,10 +16,7 @@ bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 def embed(text: str) -> T.List[float]:
     body = json.dumps({"inputText": text}).encode("utf-8")
     resp = bedrock.invoke_model(
-        modelId=MODEL_ID,
-        contentType="application/json",
-        accept="application/json",
-        body=body,
+        modelId=MODEL_ID, contentType="application/json", accept="application/json", body=body
     )
     return json.loads(resp["body"].read())["embedding"]
 
@@ -36,29 +32,25 @@ def connect() -> OpenSearch:
     )
 
 def ensure_index(client: OpenSearch):
-    """
-    Idempotent index creation (no pre-check). Works even if exists.
-    We probe the embedding dimension once for a correct knn_vector mapping.
-    """
+    """Create k-NN index; ignore 'already exists'."""
     dim = len(embed("dimension probe"))
     mapping = {
         "settings": {"index": {"knn": True}},
         "mappings": {
-          "properties": {
-            "text": {"type": "text"},
-            "vector": {
-              "type": "knn_vector",
-              "dimension": dim,
-              "method": {"name": "hnsw", "space_type": "l2", "engine": "faiss"},
-            },
-          }
+            "properties": {
+                "text": {"type": "text"},
+                "vector": {
+                    "type": "knn_vector",
+                    "dimension": dim,
+                    "method": {"name": "hnsw", "space_type": "l2", "engine": "faiss"},
+                },
+            }
         },
     }
     try:
         client.indices.create(index=INDEX, body=mapping)
     except TransportError as e:
-        # 400 is "resource_already_exists_exception" — ignore it
-        if getattr(e, "status_code", None) not in (400,):
+        if getattr(e, "status_code", None) not in (400,):  # already exists
             raise
 
 def bulk_index(client: OpenSearch, docs: T.List[str]):
@@ -73,7 +65,7 @@ def bulk_index(client: OpenSearch, docs: T.List[str]):
     return resp
 
 def lambda_handler(event=None, _ctx=None):
-    # 🔎 Log the caller so we can match it to policy principals
+    # 🔎 Log caller to confirm principal that AOSS sees
     print("CALLER", boto3.client("sts").get_caller_identity())
 
     docs = [

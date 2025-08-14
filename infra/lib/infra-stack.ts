@@ -19,27 +19,19 @@ export class InfraStack extends cdk.Stack {
       name: "rag-encryption",
       type: "encryption",
       policy: JSON.stringify({
-        Rules: [
-          {
-            ResourceType: "collection",
-            Resource: [`collection/${collectionName}`],
-          },
-        ],
+        Rules: [{ ResourceType: "collection", Resource: [`collection/${collectionName}`] }],
         AWSOwnedKey: true,
       }),
     });
 
-    // 🌐 Network policy (public HTTPS for dev) — wildcard collection + dashboard
+    // 🌐 Network policy (public HTTPS for dev) — ONLY "collection" is valid here
     const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
       name: "rag-network",
       type: "network",
       policy: JSON.stringify([
         {
-          Description: "Public access for dev (collection + dashboards)",
-          Rules: [
-            { ResourceType: "collection", Resource: ["collection/*"] },
-            { ResourceType: "dashboard", Resource: ["dashboard/*"] },
-          ],
+          Description: "Public access for dev (collection)",
+          Rules: [{ ResourceType: "collection", Resource: ["collection/*"] }],
           AllowFromPublic: true,
         },
       ]),
@@ -64,9 +56,8 @@ export class InfraStack extends cdk.Stack {
       environment: {
         OS_COLLECTION: collectionName,
         OS_INDEX: "docs",
-        OS_ENDPOINT: collection.attrCollectionEndpoint,  // AOSS data endpoint
+        OS_ENDPOINT: collection.attrCollectionEndpoint, // AOSS data endpoint
         EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
-        // AWS_REGION is provided by Lambda automatically
       },
     });
 
@@ -121,7 +112,7 @@ export class InfraStack extends cdk.Stack {
       targets: [new targets.LambdaFunction(ingestFn)],
     });
 
-    // 🔐 Bedrock + (optional) AOSS IAM actions — not strictly required for data-plane, but fine
+    // 🔐 Bedrock + (optional) AOSS IAM actions
     const bedrockPerms = new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel"],
       resources: ["*"],
