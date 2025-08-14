@@ -69,12 +69,14 @@ def bulk_index(client: OpenSearch, docs: T.List[str]):
     actions = []
     for t in docs:
         v = embed(t)
-        # ✅ Do NOT provide _id in Serverless — it will auto-generate one
+        # AOSS will auto-generate IDs; don't send _id
         actions.append({"index": {"_index": INDEX}})
         actions.append({"text": t, "vector": v})
     body = "\n".join(json.dumps(a) for a in actions) + "\n"
-    # Make docs visible once indexing finishes
-    resp = client.bulk(body=body, params={"refresh": "wait_for"})
+
+    # ✅ No refresh param for AOSS (not supported)
+    resp = client.bulk(body=body)
+
     if resp.get("errors"):
         bad = [it for it in resp.get("items", []) if list(it.values())[0].get("error")]
         print("BULK_FIRST_ERRORS", json.dumps(bad[:3]))
