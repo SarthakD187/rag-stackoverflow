@@ -96,7 +96,6 @@ export class InfraStack extends cdk.Stack {
       ingestFn.role!.roleArn,
       queryFn.role!.roleArn,
       answerFn.role!.roleArn,
-      `arn:${partition}:iam::${account}:root`, // dev safety net; remove later
     ];
     const stsPrincipals = [
       `arn:${partition}:sts::${account}:assumed-role/${ingestFn.role!.roleName}/*`,
