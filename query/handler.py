@@ -1,77 +1,109 @@
 # query/handler.py
-import os, json, typing as T, boto3, time
-from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
-from opensearchpy.exceptions import TransportError
+# Reads vectors from s3://INDEX_BUCKET/INDEX_PREFIX/chunks.jsonl
+# Computes cosine similarity (pure Python) against Titan embeddings.
+# Works for both Lambda invoke and API Gateway v2 (HTTP API).
 
-REGION = os.environ.get("AWS_REGION", "us-east-1")
-HOST = os.environ["OS_ENDPOINT"].replace("https://", "").replace("http://", "")
-INDEX = os.environ["OS_INDEX"]
-MODEL_ID = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v1")
+import os, json, math, base64, typing as T
+import boto3
+from botocore.config import Config
 
-bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+REGION        = os.environ.get("AWS_REGION", "us-east-1")
+INDEX_BUCKET  = os.environ["INDEX_BUCKET"]
+INDEX_PREFIX  = os.environ.get("INDEX_PREFIX", "rag-index")
+INDEX_KEY     = f"{INDEX_PREFIX}/chunks.jsonl"
+EMBED_MODEL   = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v1")
 
-def embed(text: str) -> T.List[float]:
-    body = json.dumps({"inputText": text}).encode("utf-8")
-    r = bedrock.invoke_model(modelId=MODEL_ID, contentType="application/json", accept="application/json", body=body)
+s3 = boto3.client("s3", region_name=REGION, config=Config(signature_version="s3v4"))
+br = boto3.client("bedrock-runtime", region_name=REGION, config=Config(retries={'max_attempts': 8, 'mode': 'standard'}))
+
+# ——— Helpers ———
+
+def _parse_event(event: dict) -> dict:
+    """Accept both direct invoke (dict) and HTTP API (body string, maybe base64)."""
+    if not isinstance(event, dict):
+        return {}
+    if "body" in event:
+        body = event["body"]
+        if event.get("isBase64Encoded"):
+            body = base64.b64decode(body).decode("utf-8", "replace")
+        try:
+            return json.loads(body) if isinstance(body, str) else (body or {})
+        except Exception:
+            return {}
+    return event
+
+def _embed(text: str) -> T.List[float]:
+    payload = json.dumps({"inputText": text}).encode("utf-8")
+    r = br.invoke_model(
+        modelId=EMBED_MODEL,
+        contentType="application/json",
+        accept="application/json",
+        body=payload,
+    )
     return json.loads(r["body"].read())["embedding"]
 
-def connect() -> OpenSearch:
-    s = boto3.Session()
-    auth = AWSV4SignerAuth(s.get_credentials(), REGION, service="aoss")
-    return OpenSearch(
-        hosts=[{"host": HOST, "port": 443}],
-        http_auth=auth,
-        use_ssl=True,
-        verify_certs=True,
-        connection_class=RequestsHttpConnection,
-    )
+def _cosine(a: T.List[float], b: T.List[float]) -> float:
+    # Robust to zeros/short arrays
+    s = 0.0; na = 0.0; nb = 0.0
+    ln = min(len(a), len(b))
+    for i in range(ln):
+        ai = float(a[i]); bi = float(b[i])
+        s += ai * bi; na += ai * ai; nb += bi * bi
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return s / (math.sqrt(na) * math.sqrt(nb))
 
-def knn_search(client: OpenSearch, q_vec: T.List[float], k: int = 3):
-    # AOSS-friendly bodies (we already know these shapes work)
-    bodies = [
-        {"size": k, "_source": ["text"], "query": {"knn": {"vector": {"vector": q_vec, "k": k}}}},
-        {"size": k, "_source": ["text"], "query": {"knn": {"vector": {"values": q_vec, "k": k}}}},
-    ]
-    last_err = None
-    for i, body in enumerate(bodies, 1):
-        try:
-            res = client.search(index=INDEX, body=body)
-            hits = res.get("hits", {}).get("hits", [])
-            # return text + score so we can dedupe and show confidence if needed
-            return [{"text": h.get("_source", {}).get("text", ""), "score": h.get("_score")} for h in hits]
-        except TransportError as e:
-            print(f"SEARCH_SHAPE_{i}_ERROR", getattr(e, "status_code", None), getattr(e, "info", None))
-            last_err = e
-            if getattr(e, "status_code", None) != 400:
-                break
-    raise last_err or RuntimeError("Search failed")
+def _stream_chunks(bucket: str, key: str):
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    # iterate line by line to support large files
+    for raw in obj["Body"].iter_lines():
+        if not raw:
+            continue
+        j = json.loads(raw)
+        text = j.get("text") or ""
+        vec  = j.get("vector") or []
+        path = j.get("path") or "unknown"
+        if text and vec:
+            yield (text, vec, path)
+
+def _rank(question: str, k: int) -> T.Tuple[T.List[str], T.List[float]]:
+    q_vec = _embed(question)
+    scored: T.List[T.Tuple[float, str]] = []
+    seen = set()
+    for text, vec, path in _stream_chunks(INDEX_BUCKET, INDEX_KEY):
+        # skip exact dupes of text
+        if text in seen:
+            continue
+        seen.add(text)
+        score = _cosine(q_vec, vec)
+        scored.append((score, text))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:k]
+    return [t for _, t in top], [float(s) for s, _ in top]
+
+def _resp(body: dict, code: int = 200):
+    return {
+        "statusCode": code,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Allow-Methods": "OPTIONS,POST",
+        },
+        "body": json.dumps(body),
+    }
+
+# ——— Handler ———
 
 def lambda_handler(event=None, _ctx=None):
-    event = event or {}
-    question = event.get("question") or "Hello world"
-    k = int(event.get("k", 3))
+    payload = _parse_event(event or {})
+    q = payload.get("question") or "What does this project do?"
+    k = int(payload.get("k", 4))
+    try:
+        contexts, scores = _rank(q, k)
+        return _resp({"question": q, "k": k, "contexts": contexts, "scores": scores}, 200)
+    except Exception as e:
+        return _resp({"error": str(e)}, 500)
 
-    q_vec = embed(question)
-    client = connect()
-    raw = knn_search(client, q_vec, k=k)
-
-    # ✅ Deduplicate by text while preserving order
-    seen = set()
-    uniq = []
-    for h in raw:
-        t = h["text"]
-        if t and t not in seen:
-            seen.add(t)
-            uniq.append(h)
-
-    return {
-        "statusCode": 200,
-        "body": json.dumps({
-            "question": question,
-            "k": k,
-            "results": [h["text"] for h in uniq],
-            "scores": [h["score"] for h in uniq],
-        }),
-    }
 if __name__ == "__main__":
-    print(lambda_handler({"question": "What does this project do?", "k": 3}))
+    print(lambda_handler({"question": "What does this project do?"}))

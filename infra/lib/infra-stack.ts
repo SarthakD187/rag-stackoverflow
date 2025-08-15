@@ -1,63 +1,56 @@
+// infra/lib/infra-stack.ts
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as path from "path";
-
-import * as lambdaPython from "@aws-cdk/aws-lambda-python-alpha";
-import * as oss from "aws-cdk-lib/aws-opensearchserverless";
+import * as s3 from "aws-cdk-lib/aws-s3";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as lambdaPython from "@aws-cdk/aws-lambda-python-alpha";
+import * as apigwv2 from "@aws-cdk/aws-apigatewayv2-alpha";
+import * as integrations from "@aws-cdk/aws-apigatewayv2-integrations-alpha";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
-import * as apigw from "aws-cdk-lib/aws-apigateway";   // ✅ API Gateway
 
 export class InfraStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const collectionName = "rag-vectors";
-
-    const enc = new oss.CfnSecurityPolicy(this, "EncryptionPolicy", {
-      name: "rag-encryption",
-      type: "encryption",
-      policy: JSON.stringify({
-        Rules: [{ ResourceType: "collection", Resource: [`collection/${collectionName}`] }],
-        AWSOwnedKey: true,
-      }),
+    // S3 bucket to store the vector index
+    const indexBucket = new s3.Bucket(this, "IndexBucket", {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // dev
+      autoDeleteObjects: true, // dev
     });
 
-    const net = new oss.CfnSecurityPolicy(this, "NetworkPolicy", {
-      name: "rag-network",
-      type: "network",
-      policy: JSON.stringify([
-        {
-          Description: "Public access for dev",
-          Rules: [{ ResourceType: "collection", Resource: [`collection/${collectionName}`] }],
-          AllowFromPublic: true,
-        },
-      ]),
-    });
+    // Single source of truth for env vars used by all Lambdas.
+    // NOTE: INDEX_KEY pins everyone to the SAME file.
+    const commonEnv = {
+      INDEX_BUCKET: indexBucket.bucketName,
+      INDEX_PREFIX: "rag-index",
+      INDEX_KEY: "rag-index/chunks.jsonl",
+      SEED_PREFIX: "seed",
+      EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
+      TEXT_MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0",
+      // Small sleep lets Bedrock breathe under bursty loads; adjust if needed.
+      EMBED_SLEEP_SECS: "0.05",
+    };
 
-    const collection = new oss.CfnCollection(this, "VectorCollection", {
-      name: collectionName,
-      type: "VECTORSEARCH",
-    });
-    collection.addDependency(enc);
-    collection.addDependency(net);
+    // Force pip to use wheels only (avoids compiling numpy in bundling image)
+    const wheelOnly = { environment: { PIP_ONLY_BINARY: ":all:" } };
 
+    // Ingest: reads raw files from s3://bucket/seed/, writes index to rag-index/
     const ingestFn = new lambdaPython.PythonFunction(this, "IngestFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../ingest"),
       index: "handler.py",
       handler: "lambda_handler",
-      memorySize: 512,
-      timeout: cdk.Duration.seconds(60),
-      environment: {
-        OS_COLLECTION: collectionName,
-        OS_INDEX: "docs",
-        OS_ENDPOINT: collection.attrCollectionEndpoint,
-        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
-      },
+      memorySize: 1024,
+      timeout: cdk.Duration.minutes(5),
+      environment: commonEnv,
+      bundling: wheelOnly,
     });
 
+    // Query: reads vectors/meta from S3 (same INDEX_KEY as AnswerFn)
     const queryFn = new lambdaPython.PythonFunction(this, "QueryFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../query"),
@@ -65,108 +58,72 @@ export class InfraStack extends cdk.Stack {
       handler: "lambda_handler",
       memorySize: 512,
       timeout: cdk.Duration.seconds(20),
-      environment: {
-        OS_COLLECTION: collectionName,
-        OS_INDEX: "docs",
-        OS_ENDPOINT: collection.attrCollectionEndpoint,
-        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
-      },
+      environment: commonEnv,
+      bundling: wheelOnly,
     });
 
+    // Answer: retrieval + LLM synthesis (same INDEX_KEY as QueryFn)
     const answerFn = new lambdaPython.PythonFunction(this, "AnswerFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../answer"),
       index: "handler.py",
       handler: "lambda_handler",
       memorySize: 512,
-      timeout: cdk.Duration.seconds(20),
-      environment: {
-        OS_COLLECTION: collectionName,
-        OS_INDEX: "docs",
-        OS_ENDPOINT: collection.attrCollectionEndpoint,
-        EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
-        TEXT_MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0",
-      },
+      timeout: cdk.Duration.seconds(25), // within API GW 29s limit
+      environment: commonEnv,
+      bundling: wheelOnly,
     });
 
-    /** Data-access policy (dev): full access for Lambdas */
-    const account   = cdk.Stack.of(this).account;
-    const partition = cdk.Stack.of(this).partition;
+    // IAM: S3 access
+    indexBucket.grantReadWrite(ingestFn);  // put vectors/meta + read seed
+    indexBucket.grantRead(queryFn);        // read vectors/meta
+    indexBucket.grantRead(answerFn);       // read vectors/meta
 
-    const iamPrincipals = [
-      ingestFn.role!.roleArn,
-      queryFn.role!.roleArn,
-      answerFn.role!.roleArn,
-    ];
-    const stsPrincipals = [
-      `arn:${partition}:sts::${account}:assumed-role/${ingestFn.role!.roleName}/*`,
-      `arn:${partition}:sts::${account}:assumed-role/${queryFn.role!.roleName}/*`,
-      `arn:${partition}:sts::${account}:assumed-role/${answerFn.role!.roleName}/*`,
-    ];
-
-    const dataPolicy = new oss.CfnAccessPolicy(this, "VectorPolicy", {
-      name: "rag-access",
-      type: "data",
-      policy: JSON.stringify([
-        {
-          Rules: [
-            { ResourceType: "index", Resource: [`index/${collectionName}/*`], Permission: ["aoss:*"] },
-            { ResourceType: "collection", Resource: [`collection/${collectionName}`], Permission: ["aoss:*"] },
-          ],
-          Principal: [...iamPrincipals, ...stsPrincipals],
-          Description: "Dev full access from Lambdas to collection & indexes",
-        },
-      ]),
-    });
-    dataPolicy.node.addDependency(ingestFn);
-    dataPolicy.node.addDependency(queryFn);
-    dataPolicy.node.addDependency(answerFn);
-    dataPolicy.node.addDependency(collection);
-
-    // ⏰ Daily ingest (03:00 UTC)
-    new events.Rule(this, "DailyIngestSchedule", {
-      schedule: events.Schedule.cron({ minute: "0", hour: "3" }),
-      targets: [new targets.LambdaFunction(ingestFn)],
-    });
-
-    // 🔐 Permissions
+    // IAM: Bedrock (include streaming for AnswerFn/QueryFn if used)
     const bedrockPerms = new iam.PolicyStatement({
-      actions: ["bedrock:InvokeModel"],
-      resources: ["*"],
+      actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      resources: ["*"], // (optional) narrow to model ARNs later
     });
     [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(bedrockPerms));
 
-    const osPerms = new iam.PolicyStatement({
-      actions: [
-        "aoss:APIAccessAll",
-        "aoss:CreateIndex",
-        "aoss:WriteDocument",
-        "aoss:ReadDocument",
-        "aoss:DescribeIndex",
-      ],
-      resources: ["*"],
-    });
-    [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(osPerms));
-
-    // 🌐 Public API for AnswerFn
-    const api = new apigw.RestApi(this, "RagApi", {
-      restApiName: "RagStackOverflowApi",
-      description: "RAG Q&A public endpoint",
-      defaultCorsPreflightOptions: {
-        allowOrigins: apigw.Cors.ALL_ORIGINS,  // dev-friendly; tighten later
-        allowMethods: apigw.Cors.ALL_METHODS,
-        allowHeaders: ["Content-Type", "Authorization"],
+    // HTTP API with CORS enabled (dev-friendly; tighten origins for prod)
+    const api = new apigwv2.HttpApi(this, "Api", {
+      apiName: "rag-api",
+      corsPreflight: {
+        allowOrigins: ["*"], // e.g., replace with ["http://localhost:5173", "https://yourdomain.com"] for prod
+        allowMethods: [apigwv2.CorsHttpMethod.ANY],
+        allowHeaders: ["content-type"],
       },
-      deployOptions: { stageName: "prod" },
     });
 
-    const answerRes = api.root.addResource("answer");
-    answerRes.addMethod("POST", new apigw.LambdaIntegration(answerFn, { proxy: true }));
+    api.addRoutes({
+      path: "/query",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new integrations.HttpLambdaIntegration("QueryInt", queryFn),
+    });
+    api.addRoutes({
+      path: "/answer",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new integrations.HttpLambdaIntegration("AnswerInt", answerFn),
+    });
+
+    // Nightly clean re-index (03:00 UTC) with truncate=true to avoid stale junk
+    new events.Rule(this, "NightlyIngest", {
+      schedule: events.Schedule.cron({ minute: "0", hour: "3" }),
+      targets: [
+        new targets.LambdaFunction(ingestFn, {
+          event: events.RuleTargetInput.fromObject({
+            truncate: true,
+            limit: 2000, // adjust to your corpus size
+          }),
+        }),
+      ],
+    });
 
     // Outputs
-    new cdk.CfnOutput(this, "OpenSearchCollectionEndpoint", {
-      value: collection.attrCollectionEndpoint,
-    });
-    new cdk.CfnOutput(this, "AnswerApiUrl", { value: `${api.url}answer` });
+    new cdk.CfnOutput(this, "ApiUrl", { value: api.apiEndpoint });
+    new cdk.CfnOutput(this, "QueryUrl", { value: `${api.apiEndpoint}/query` });
+    new cdk.CfnOutput(this, "AnswerUrl", { value: `${api.apiEndpoint}/answer` });
+    new cdk.CfnOutput(this, "IndexBucketName", { value: indexBucket.bucketName });
   }
 }

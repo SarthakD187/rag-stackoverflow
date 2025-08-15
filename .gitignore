@@ -1,16 +1,25 @@
 # OS
 .DS_Store
-infra/.DS_Store
+.idea/
+.vscode/
 
 # Python
-.venv/
 __pycache__/
 *.py[cod]
+.venv/
+.env
+.pytest_cache/
 *.egg-info/
 
 # Node / CDK
+node_modules/
 infra/node_modules/
 infra/cdk.out/
+
+# Local/generated data
+infra/chunks.jsonl
+dataset/
+*.log
 
 # Env
 .env
@@ -18,3 +27,6 @@ infra/cdk.out/
 
 # Local scratch
 infra_old/
+
+# Misc
+*.zip
