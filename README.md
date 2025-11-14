@@ -156,15 +156,125 @@ Chunking: default ~800 chars with ~120 overlap (tune in ingest/handler.py).
 Point aws s3 sync at your repos, docs, ADRs, run ingest, then query/answer.
 If answers mention old components (e.g., OpenSearch), update your docs—answers mirror your corpus.
 
-🔐 Security notes (dev vs prod)
+🔐 Security & Production Hardening
 
-Bucket is private; Lambdas get least-priv S3 read/write as needed.
+⚠️ **Current state: MVP/Development** - Several hardening steps required before production use.
 
-Bedrock IAM policy currently allows bedrock:InvokeModel on * (dev). Narrow to specific model ARNs for prod.
+### Required for Production (P0)
 
-Enable CORS on the API if you’ll call it from a browser app (limit to your origin domains).
+**Authentication & Authorization**
+- [ ] Add API Gateway authorizer (AWS IAM, Cognito, or Lambda authorizer)
+- [ ] Implement request signing for Lambda-to-Lambda calls if needed
+- [ ] Consider AWS WAF for additional protection
 
-Consider VPC endpoints / IAM conditions if stricter isolation is required.
+**Rate Limiting & Abuse Prevention**
+- [ ] Enable API Gateway throttling (per-client quotas)
+- [ ] Add input validation bounds:
+  - Max `k` parameter (e.g., 1-20 results)
+  - Max question length (e.g., 500 chars)
+  - Max files per ingest run
+- [ ] Implement request size limits
+
+**CORS Hardening**
+- [ ] Replace `allowOrigins: ["*"]` with specific domain(s) in `infra/lib/infra-stack.ts:93`
+- [ ] Restrict `allowHeaders` and `allowMethods` to minimum required
+
+**IAM Tightening**
+- [ ] Narrow Bedrock policy from `resources: ["*"]` to specific model ARNs:
+  ```typescript
+  resources: [
+    `arn:aws:bedrock:${this.region}::foundation-model/amazon.titan-embed-text-v1`,
+    `arn:aws:bedrock:${this.region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0`,
+  ]
+  ```
+- [ ] Add S3 bucket policies with explicit deny rules for unauthorized access
+- [ ] Enable S3 bucket versioning and MFA delete for index protection
+
+**Error Handling**
+- [ ] Sanitize error messages - never expose stack traces or internal paths to clients
+- [ ] Classify errors (400 for client errors, 500 for server errors, 429 for throttling)
+- [ ] Log detailed errors internally but return generic messages externally
+
+### Recommended for Production (P1)
+
+**Observability**
+- [ ] Implement structured logging (use AWS Lambda Powertools)
+- [ ] Add CloudWatch metrics:
+  - Request latency per endpoint
+  - Bedrock API call duration/throttling
+  - Token usage and costs
+  - Index size and chunk count
+- [ ] Set up CloudWatch alarms for errors, throttling, high latency
+- [ ] Add request correlation IDs for tracing query → answer flows
+- [ ] Create CloudWatch dashboard for operational visibility
+
+**Configuration Management**
+- [ ] Move environment variables to AWS Systems Manager Parameter Store
+- [ ] Separate dev/staging/prod configurations
+- [ ] Validate required config at Lambda cold start
+- [ ] Use AWS Secrets Manager for any API keys (if integrating external services)
+
+**Networking**
+- [ ] Deploy Lambdas in VPC if accessing private resources
+- [ ] Use VPC endpoints for S3 and Bedrock to avoid internet egress
+- [ ] Enable VPC Flow Logs for network monitoring
+
+**Data Protection**
+- [ ] Enable S3 bucket encryption at rest (already using S3_MANAGED, consider KMS)
+- [ ] Implement S3 access logging
+- [ ] Add S3 lifecycle policies for old index versions
+- [ ] Consider S3 Object Lock for compliance requirements
+
+**Resilience**
+- [ ] Implement circuit breakers for Bedrock API calls
+- [ ] Add retry logic with exponential backoff (partially done in ingest)
+- [ ] Set up Lambda reserved concurrency to prevent runaway costs
+- [ ] Create dead letter queues for failed async invocations
+
+### Nice-to-Have (P2)
+
+**Code Quality**
+- [ ] Add unit and integration tests (current test suite is empty)
+- [ ] Extract duplicate code (`_embed()`, `_cosine()`, `_parse_event()`) to shared module
+- [ ] Add comprehensive docstrings with parameter types and exceptions
+- [ ] Clean up unused dependencies in requirements.lock
+
+**Documentation**
+- [ ] Create OpenAPI/Swagger spec for API endpoints
+- [ ] Write operational runbook (monitoring, troubleshooting, rollback procedures)
+- [ ] Document error codes and meanings
+- [ ] Add performance tuning guide
+- [ ] Create cost estimation calculator
+
+**Performance**
+- [ ] Benchmark query latency at various index sizes
+- [ ] Consider caching for frequent queries (ElastiCache or API Gateway caching)
+- [ ] Optimize S3 streaming for large indexes (use pagination tokens)
+- [ ] Compress JSONL with gzip if index exceeds 100MB
+- [ ] Consider Lambda SnapStart for faster cold starts
+
+**Advanced Security**
+- [ ] Enable AWS Config rules for compliance monitoring
+- [ ] Implement AWS CloudTrail for audit logging
+- [ ] Use AWS GuardDuty for threat detection
+- [ ] Consider field-level encryption for sensitive documents
+- [ ] Add data classification tags to S3 objects
+
+### Current Security Posture
+
+✅ **Already implemented:**
+- Private S3 bucket (BlockPublicAccess enabled)
+- Least-privilege IAM for Lambda S3 access
+- Encryption at rest (S3 managed keys)
+- HTTPS-only API endpoints
+
+⚠️ **Dev-only settings (change for prod):**
+- CORS: `allowOrigins: ["*"]` → restrict to your domains
+- Bedrock IAM: `resources: ["*"]` → specific model ARNs
+- No authentication on API endpoints
+- No rate limiting
+- RemovalPolicy: DESTROY (good for dev, risky for prod data)
+- Generic error messages expose internal details
 
 💸 Costs
 
@@ -176,15 +286,55 @@ Keep datasets modest; gzip the JSONL if it grows; turn off nightly ingest if idl
 cd infra
 npx aws-cdk@latest destroy
 
+🔧 Additional Polish Needed
+
+Beyond security hardening, several areas could benefit from improvement:
+
+**Error Handling**
+- Add proper error classification (distinguish client vs server errors)
+- Implement structured error responses with error codes
+- Add retry logic with exponential backoff for all Bedrock calls
+- Validate input parameters (k bounds, question length, file limits)
+
+**Observability**
+- Replace `print()` with structured logging (AWS Lambda Powertools recommended)
+- Add CloudWatch metrics for latency, costs, and performance
+- Implement request tracing with correlation IDs
+- Create operational dashboards and alarms
+
+**Code Quality**
+- Add unit and integration tests (test suite is currently empty)
+- Extract duplicate code across handlers to shared utilities
+- Add type hints and docstrings consistently
+- Remove unused dependencies from requirements.lock (langchain, opensearch-py, etc.)
+
+**Configuration**
+- Centralize magic numbers (chunk size, overlap, timeouts) to single config
+- Move env vars to Parameter Store for easier updates
+- Add config validation at Lambda startup
+- Support multiple environments (dev/staging/prod)
+
+**Documentation**
+- Create OpenAPI spec for `/query` and `/answer` endpoints
+- Write operational runbook (monitoring, troubleshooting, rollback)
+- Document error codes and recovery procedures
+- Add architecture decision records (ADRs)
+
+**Performance**
+- Benchmark query latency at scale (1K, 10K, 100K chunks)
+- Add caching for frequently asked questions
+- Optimize S3 streaming for large indexes
+- Consider Lambda SnapStart for cold start reduction
+
 🛣️ Roadmap
 
-Minimal web UI (one-page chat) that shows contexts + scores
+Minimal web UI enhancements (show contexts + scores, multi-turn chat)
 
-Observability: latency + token metrics
+Incremental index updates (avoid full re-index for new docs)
 
-Tighten IAM & networking
+Multi-region deployment pattern
 
-Tune nightly re-ingest (currently 03:00 UTC) and add incremental updates
+Support for additional embedding models (Cohere, Voyage AI)
 
 🧾 License
 
