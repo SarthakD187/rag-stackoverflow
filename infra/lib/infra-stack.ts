@@ -1,4 +1,3 @@
-// infra/lib/infra-stack.ts
 import * as cdk from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as path from "path";
@@ -14,31 +13,47 @@ export class InfraStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // S3 bucket to store the vector index
+    const allowedOrigin = this.node.tryGetContext("frontendOrigin") ?? "*";
+    const enableNightlyIngest = this.node.tryGetContext("enableNightlyIngest") !== "false";
+    const embedModelId = this.node.tryGetContext("embedModelId") ?? "amazon.titan-embed-text-v1";
+    const textModelId =
+      this.node.tryGetContext("textModelId") ?? "anthropic.claude-3-haiku-20240307-v1:0";
+
     const indexBucket = new s3.Bucket(this, "IndexBucket", {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // dev
-      autoDeleteObjects: true, // dev
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
     });
 
-    // Single source of truth for env vars used by all Lambdas.
-    // NOTE: INDEX_KEY pins everyone to the SAME file.
     const commonEnv = {
+      AWS_REGION: cdk.Stack.of(this).region,
       INDEX_BUCKET: indexBucket.bucketName,
       INDEX_PREFIX: "rag-index",
-      INDEX_KEY: "rag-index/chunks.jsonl",
       SEED_PREFIX: "seed",
-      EMBED_MODEL_ID: "amazon.titan-embed-text-v1",
-      TEXT_MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0",
-      // Small sleep lets Bedrock breathe under bursty loads; adjust if needed.
+      EMBED_MODEL_ID: embedModelId,
+      TEXT_MODEL_ID: textModelId,
       EMBED_SLEEP_SECS: "0.05",
     };
 
-    // Force pip to use wheels only (avoids compiling numpy in bundling image)
-    const wheelOnly = { environment: { PIP_ONLY_BINARY: ":all:" } };
+    const bundlingWithShared = {
+      environment: { PIP_ONLY_BINARY: ":all:" },
+      commandHooks: {
+        beforeInstall(): string[] {
+          return [];
+        },
+        beforeBundling(): string[] {
+          return [];
+        },
+        afterBundling(inputDir: string, outputDir: string): string[] {
+          return [
+            `mkdir -p ${outputDir}/shared`,
+            `cp -R ${path.posix.join(inputDir, "..", "shared", ".")} ${outputDir}/shared`,
+          ];
+        },
+      },
+    };
 
-    // Ingest: reads raw files from s3://bucket/seed/, writes index to rag-index/
     const ingestFn = new lambdaPython.PythonFunction(this, "IngestFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../ingest"),
@@ -47,10 +62,9 @@ export class InfraStack extends cdk.Stack {
       memorySize: 1024,
       timeout: cdk.Duration.minutes(5),
       environment: commonEnv,
-      bundling: wheelOnly,
+      bundling: bundlingWithShared,
     });
 
-    // Query: reads vectors/meta from S3 (same INDEX_KEY as AnswerFn)
     const queryFn = new lambdaPython.PythonFunction(this, "QueryFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../query"),
@@ -59,39 +73,52 @@ export class InfraStack extends cdk.Stack {
       memorySize: 512,
       timeout: cdk.Duration.seconds(20),
       environment: commonEnv,
-      bundling: wheelOnly,
+      bundling: bundlingWithShared,
     });
 
-    // Answer: retrieval + LLM synthesis (same INDEX_KEY as QueryFn)
     const answerFn = new lambdaPython.PythonFunction(this, "AnswerFn", {
       runtime: cdk.aws_lambda.Runtime.PYTHON_3_11,
       entry: path.join(__dirname, "../../answer"),
       index: "handler.py",
       handler: "lambda_handler",
       memorySize: 512,
-      timeout: cdk.Duration.seconds(25), // within API GW 29s limit
+      timeout: cdk.Duration.seconds(25),
       environment: commonEnv,
-      bundling: wheelOnly,
+      bundling: bundlingWithShared,
     });
 
-    // IAM: S3 access
-    indexBucket.grantReadWrite(ingestFn);  // put vectors/meta + read seed
-    indexBucket.grantRead(queryFn);        // read vectors/meta
-    indexBucket.grantRead(answerFn);       // read vectors/meta
+    indexBucket.grantReadWrite(ingestFn);
+    indexBucket.grantRead(queryFn);
+    indexBucket.grantRead(answerFn);
 
-    // IAM: Bedrock (include streaming for AnswerFn/QueryFn if used)
+    const embedModelArn = cdk.Stack.of(this).formatArn({
+      service: "bedrock",
+      region: cdk.Stack.of(this).region,
+      account: "",
+      resource: "foundation-model",
+      resourceName: embedModelId,
+      arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+    });
+    const textModelArn = cdk.Stack.of(this).formatArn({
+      service: "bedrock",
+      region: cdk.Stack.of(this).region,
+      account: "",
+      resource: "foundation-model",
+      resourceName: textModelId,
+      arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+    });
+
     const bedrockPerms = new iam.PolicyStatement({
       actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-      resources: ["*"], // (optional) narrow to model ARNs later
+      resources: [embedModelArn, textModelArn],
     });
-    [ingestFn, queryFn, answerFn].forEach(fn => fn.addToRolePolicy(bedrockPerms));
+    [ingestFn, queryFn, answerFn].forEach((fn) => fn.addToRolePolicy(bedrockPerms));
 
-    // HTTP API with CORS enabled (dev-friendly; tighten origins for prod)
     const api = new apigwv2.HttpApi(this, "Api", {
       apiName: "rag-api",
       corsPreflight: {
-        allowOrigins: ["*"], // e.g., replace with ["http://localhost:5173", "https://yourdomain.com"] for prod
-        allowMethods: [apigwv2.CorsHttpMethod.ANY],
+        allowOrigins: [allowedOrigin],
+        allowMethods: [apigwv2.CorsHttpMethod.POST, apigwv2.CorsHttpMethod.OPTIONS],
         allowHeaders: ["content-type"],
       },
     });
@@ -101,26 +128,27 @@ export class InfraStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.POST],
       integration: new integrations.HttpLambdaIntegration("QueryInt", queryFn),
     });
+
     api.addRoutes({
       path: "/answer",
       methods: [apigwv2.HttpMethod.POST],
       integration: new integrations.HttpLambdaIntegration("AnswerInt", answerFn),
     });
 
-    // Nightly clean re-index (03:00 UTC) with truncate=true to avoid stale junk
-    new events.Rule(this, "NightlyIngest", {
-      schedule: events.Schedule.cron({ minute: "0", hour: "3" }),
-      targets: [
-        new targets.LambdaFunction(ingestFn, {
-          event: events.RuleTargetInput.fromObject({
-            truncate: true,
-            limit: 2000, // adjust to your corpus size
+    if (enableNightlyIngest) {
+      new events.Rule(this, "NightlyIngest", {
+        schedule: events.Schedule.cron({ minute: "0", hour: "3" }),
+        targets: [
+          new targets.LambdaFunction(ingestFn, {
+            event: events.RuleTargetInput.fromObject({
+              truncate: true,
+              limit: 2000,
+            }),
           }),
-        }),
-      ],
-    });
+        ],
+      });
+    }
 
-    // Outputs
     new cdk.CfnOutput(this, "ApiUrl", { value: api.apiEndpoint });
     new cdk.CfnOutput(this, "QueryUrl", { value: `${api.apiEndpoint}/query` });
     new cdk.CfnOutput(this, "AnswerUrl", { value: `${api.apiEndpoint}/answer` });

@@ -1,14 +1,16 @@
-# Welcome to your CDK TypeScript project
+# CDK Infra
 
-This is a blank project for CDK development with TypeScript.
+CDK app that deploys:
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
+- `IndexBucket` S3 bucket
+- `IngestFn`, `QueryFn`, `AnswerFn` Lambda functions
+- HTTP API with `POST /query` and `POST /answer`
+- Optional nightly EventBridge rule for re-indexing (context `enableNightlyIngest`)
 
-## Useful commands
+Useful commands:
 
-* `npm run build`   compile typescript to js
-* `npm run watch`   watch for changes and compile
-* `npm run test`    perform the jest unit tests
-* `npx cdk deploy`  deploy this stack to your default AWS account/region
-* `npx cdk diff`    compare deployed stack with current state
-* `npx cdk synth`   emits the synthesized CloudFormation template
+- `npm run build`
+- `npm run test`
+- `npx cdk synth`
+- `npx cdk deploy`
+- `npx cdk diff`

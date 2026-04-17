@@ -11,6 +11,7 @@
     .primary { background: black; color: white; }
     code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; }
     .muted { color: #6b7280; }
+    .error { color: #b91c1c; }
   </style>
 </head>
 <body>
@@ -21,16 +22,19 @@
     <label>Endpoint: <code id="api"></code></label>
     <div style="display:flex; gap:8px; margin-top:8px;">
       <input id="q" style="flex:1; padding:10px; border-radius:10px; border:1px solid #e5e7eb" placeholder="What does this project do?" />
-      <input id="k" type="number" min="1" max="10" value="3" style="width:80px; padding:10px; border-radius:10px; border:1px solid #e5e7eb" />
+      <input id="k" type="number" min="1" max="20" value="3" style="width:80px; padding:10px; border-radius:10px; border:1px solid #e5e7eb" />
       <button class="primary" id="ask">Ask</button>
     </div>
   </div>
 
   <div id="out"></div>
 
+  <script src="./config.js"></script>
   <script>
-    const API = "https://dnoff694v5.execute-api.us-east-1.amazonaws.com/answer"; 
-    document.getElementById("api").textContent = API;
+    const configuredApi = window.__RAG_CONFIG__ && window.__RAG_CONFIG__.API_URL;
+    const API = configuredApi || new URLSearchParams(window.location.search).get("api") || "";
+
+    document.getElementById("api").textContent = API || "Not configured";
 
     function el(html){const d=document.createElement('div'); d.innerHTML=html; return d.firstElementChild;}
 
@@ -39,29 +43,43 @@
       const k = parseInt(document.getElementById('k').value || '3', 10);
       const out = document.getElementById('out');
       out.innerHTML = '';
-      out.append(el(`<div class="card"><em>Asking…</em></div>`));
+
+      if(!API){
+        out.append(el('<div class="card error"><b>Configuration error:</b> API endpoint is not set. Update <code>web/config.js</code> or provide ?api=...</div>'));
+        return;
+      }
+
+      out.append(el('<div class="card"><em>Asking…</em></div>'));
 
       try{
-        const r = await fetch(API, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question:q, k}) });
-        const j = await r.json();
+        const response = await fetch(API, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({question:q, k})
+        });
+        const payload = await response.json();
         out.innerHTML = '';
 
-        if(j.error){
-          out.append(el(`<div class="card"><b>Error:</b> ${j.error}<br><span class="muted">${j.detail||''}</span></div>`));
+        if(!response.ok || payload.error){
+          const message = payload.error || `Request failed with status ${response.status}`;
+          out.append(el(`<div class="card error"><b>Error:</b> ${message}</div>`));
           return;
         }
 
-        out.append(el(`<div class="card"><b>Answer</b><p>${(j.answer||'').replace(/\n/g,'<br>')}</p></div>`));
+        out.append(el(`<div class="card"><b>Answer</b><p>${(payload.answer||'').replace(/\n/g,'<br>')}</p></div>`));
 
-        if(Array.isArray(j.contexts)){
-          const ctx = j.contexts.map((t,i)=>`<li>${t} <span class="muted">(${(j.scores?.[i]??0).toFixed(4)})</span></li>`).join('');
+        if(Array.isArray(payload.contexts)){
+          const ctx = payload.contexts
+            .map((text,i)=>`<li>${text} <span class="muted">(${(payload.scores?.[i]??0).toFixed(4)})</span></li>`)
+            .join('');
           out.append(el(`<div class="card"><b>Top-k contexts</b><ol>${ctx}</ol></div>`));
         }
-      }catch(e){
+      }catch(_err){
         out.innerHTML = '';
-        out.append(el(`<div class="card"><b>Network error</b><pre>${e}</pre></div>`));
+        out.append(el('<div class="card error"><b>Network error:</b> Failed to reach API endpoint.</div>'));
       }
     }
+
     document.getElementById('ask').addEventListener('click', ask);
   </script>
 </body>
